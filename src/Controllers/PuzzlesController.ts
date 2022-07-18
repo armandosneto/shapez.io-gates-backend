@@ -37,6 +37,7 @@ type Difficulty = 1 | 2 | 3;
 class PuzzlesController {
   async list(request: Request, response: Response) {
     const category = request.params.category as category;
+    const userId = response.locals.userId;
 
     switch (category) {
       case "official":
@@ -45,34 +46,28 @@ class PuzzlesController {
             user: null,
           },
         });
-        return response
-          .status(200)
-          .json(await onlyMetadata(officialPuzzles, response.locals.userId));
+        return response.json(await onlyMetadata(officialPuzzles, userId));
 
       case "completed":
         const completedPuzzles = await client.puzzle.findMany({
           where: {
             completionsData: {
               some: {
-                userId: response.locals.userId,
+                userId,
                 completed: true,
               },
             },
           },
         });
-        return response
-          .status(200)
-          .json(await onlyMetadata(completedPuzzles, response.locals.userId));
+        return response.json(await onlyMetadata(completedPuzzles, userId));
 
       case "mine":
         const myPuzzles = await client.puzzle.findMany({
           where: {
-            author: response.locals.userId,
+            author: userId,
           },
         });
-        return response
-          .status(200)
-          .json(await onlyMetadata(myPuzzles, response.locals.userId));
+        return response.json(await onlyMetadata(myPuzzles, userId));
 
       case "new":
         const newPuzzles = await client.puzzle.findMany({
@@ -80,9 +75,7 @@ class PuzzlesController {
             createdAt: "desc",
           },
         });
-        return response
-          .status(200)
-          .json(await onlyMetadata(newPuzzles, response.locals.userId));
+        return response.json(await onlyMetadata(newPuzzles, userId));
 
       case "top-rated":
         const topRatedPuzzles = await client.puzzle.findMany({
@@ -90,9 +83,7 @@ class PuzzlesController {
             likes: "desc",
           },
         });
-        return response
-          .status(200)
-          .json(await onlyMetadata(topRatedPuzzles, response.locals.userId));
+        return response.json(await onlyMetadata(topRatedPuzzles, userId));
 
       case "easy":
       case "medium":
@@ -106,9 +97,7 @@ class PuzzlesController {
             },
           },
         });
-        return response
-          .status(200)
-          .json(await onlyMetadata(puzzlesByDificulty, response.locals.userId));
+        return response.json(await onlyMetadata(puzzlesByDificulty, response.locals.userId));
 
       default:
         throw new Error("Invalid category!");
@@ -133,8 +122,6 @@ class PuzzlesController {
             },
           },
         ],
-        // TODO implement difficulty search
-        // difficulty: difficulty as string,
       },
     });
 
@@ -147,6 +134,7 @@ class PuzzlesController {
       metadata = metadata.filter((puzzle) => puzzle.completed === false);
     }
 
+    // TODO filter in the query
     if (difficulty && difficulty !== "any") {
       const range = difficultyRanges[difficulty];
       metadata = metadata.filter(
@@ -172,7 +160,7 @@ class PuzzlesController {
       });
     }
 
-    return response.status(200).json(metadata);
+    return response.json(metadata);
   }
 
   async report(request: Request, response: Response) {
@@ -211,7 +199,7 @@ class PuzzlesController {
     });
 
     // Never should happen
-    if (user == null) {
+    if (user === null) {
       throw new AppError("Authentication inconsistency!", 401);
     }
 
@@ -240,6 +228,8 @@ class PuzzlesController {
       return response.status(404).send();
     }
 
+    const userId = response.locals.userId;
+
     const {
       time,
       liked,
@@ -248,11 +238,13 @@ class PuzzlesController {
       difficultyRating,
     } = request.body;
 
+    const previousCompleteData = (await findPuzzleCompleteData(puzzleId, userId))!;
+
     // In reality, we only have one
     const completeData = await client.puzzleCompleteData.updateMany({
       where: {
         puzzleId,
-        userId: response.locals.userId,
+        userId,
       },
       data: {
         timeTaken: time,
@@ -264,21 +256,43 @@ class PuzzlesController {
       },
     });
 
-    const newAverage = calculateNewAverage(puzzle, time);
+    let likes = puzzle.likes;
+    let completions = puzzle.completions;
+    let averageTime = puzzle.averageTime;
+    let averageDifficultyRating = puzzle.averageDifficultyRating;
 
+    if (!previousCompleteData.completed) {
+      averageTime = calculateNewAverage(puzzle.averageTime, puzzle.completions, time);
+      averageDifficultyRating = calculateNewAverage(puzzle.averageDifficultyRating, puzzle.completions, difficultyRating);
+
+      likes += liked ? 1 : 0;
+      completions++;
+    }
+    else {
+      averageDifficultyRating = recalculateAverage(averageDifficultyRating!, puzzle.completions, previousCompleteData.difficultyRating, difficultyRating);
+      
+      if (previousCompleteData.liked && !liked) {
+        likes--;
+      }
+      else if (!previousCompleteData.liked && liked) {
+        likes++;
+      }
+    }
+  
     await client.puzzle.update({
       where: {
         id: puzzleId,
       },
       data: {
-        likes: puzzle.likes + liked ? 1 : 0,
-        completions: puzzle.completions + 1,
-        averageTime: newAverage,
-        difficulty: calculateDifficulty(newAverage, difficultyRating),
+        likes,
+        completions,
+        averageTime,
+        averageDifficultyRating,
+        difficulty: calculateDifficulty(averageTime!, averageDifficultyRating),
       },
     });
 
-    return response.status(200).json(completeData);
+    return response.json(completeData);
   }
 
   async download(request: Request, response: Response) {
@@ -315,15 +329,13 @@ class PuzzlesController {
 
     const { data, ...metaData } = puzzle;
 
-    let difficultyRating: string | undefined | null;
+    let difficultyRating: string | null = null;
 
-    if (!completeData || completeData.difficultyRating === null) {
-      difficultyRating = undefined;
-    } else if (completeData && completeData.difficultyRating >= 0) {
-      difficultyRating = difficultyLabels[completeData?.difficultyRating];
+    if (completeData !== null && completeData.difficultyRating !== null) {
+      difficultyRating = difficultyLabels[completeData.difficultyRating];
     }
 
-    return response.status(200).json({
+    return response.json({
       game: data,
       meta: {
         ...metaData,
@@ -345,7 +357,7 @@ class PuzzlesController {
     });
 
     if (!puzzle) {
-      return response.status(200).json({ success: false });
+      return response.json({ success: false });
     }
 
     await client.puzzle.delete({
@@ -354,14 +366,11 @@ class PuzzlesController {
       },
     });
 
-    return response.status(200).json({ success: true });
+    return response.json({ success: true });
   }
 }
 
-function findPuzzleCompleteData(
-  puzzleId: number,
-  userId: string
-): Promise<PuzzleCompleteData | null> {
+function findPuzzleCompleteData(puzzleId: number, userId: string): Promise<PuzzleCompleteData | null> {
   return client.puzzleCompleteData.findFirst({
     where: {
       puzzleId,
@@ -371,10 +380,7 @@ function findPuzzleCompleteData(
 }
 
 // TODO maybe get metadata by joins, or at least fetch all puzzles at once
-function onlyMetadata(
-  puzzles: Puzzle[],
-  userId: string
-): Promise<PuzzleMetadata[]> {
+function onlyMetadata(puzzles: Puzzle[], userId: string): Promise<PuzzleMetadata[]> {
   return Promise.all(
     puzzles.map(async (puzzle) => {
       const completeData = await findPuzzleCompleteData(puzzle.id, userId);
@@ -403,24 +409,35 @@ function findPuzzleById(puzzleId: number): Promise<Puzzle | null> {
   });
 }
 
-function calculateNewAverage(puzzle: Puzzle, time: number): number {
-  return (
-    ((puzzle.averageTime ? puzzle.averageTime : 0) * puzzle.completions +
-      time) /
-    (puzzle.completions + 1)
-  );
+function calculateNewAverage(oldAverage: number | null, oldTotal: number, newValue: number | null): number | null {
+  if (oldAverage === null) {
+    return newValue;
+  }
+  if (newValue === null) {
+    return oldAverage;
+  }
+  return (oldAverage * oldTotal + newValue) / (oldTotal + 1);
+}
+
+function recalculateAverage(oldAverage: number | null, total: number, oldValue: number | null, newValue: number | null): number | null {
+  if (oldAverage === null) {
+    return newValue;
+  }
+  if (newValue === null || oldValue == newValue) {
+    return oldAverage;
+  }
+  if (oldValue === null) {
+    oldValue = oldAverage;
+  }
+  return oldAverage - oldValue / total + newValue / total;
 }
 
 // Needs to return a number between 0 and 1 no matter the inputs
-function calculateDifficulty(
-  averageTime: number,
-  difficultyRating: Difficulty
-): number {
-  return (
-    (1 / (1 + Math.pow(Math.E, -(averageTime * difficultyRating) / 300)) -
-      0.5) *
-    2
-  );
+function calculateDifficulty(averageTime: number, averageDifficulty: number | null): number {
+  if (averageDifficulty === null) {
+    averageDifficulty = 0;
+  }
+  return (1 / (1 + (Math.pow(Math.E, - (averageTime) / 300))) - 0.5) + averageDifficulty / 4;
 }
 
 export { PuzzlesController };
